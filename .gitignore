@@ -1,0 +1,11 @@
+# Cargo build output
+/target/
+
+# Bundled release folder produced by build.cmd
+/release/
+
+# Model weights (found next to the app, in ..\models, or downloaded on first use)
+/models/*.onnx
+
+# Self-test report
+vcam_selftest.txt

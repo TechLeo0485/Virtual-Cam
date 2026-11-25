@@ -1,0 +1,66 @@
+[package]
+name = "vcam"
+version = "0.1.0"
+edition = "2021"
+description = "Real-time webcam virtual background (RobustVideoMatting) published as a system virtual camera. Rust port of vcam.py / vcam_ui.py."
+default-run = "vcam"
+build = "build.rs"
+
+[lib]
+name = "vcam"
+path = "src/lib.rs"
+
+# GUI control panel (port of vcam_ui.py). Windowed: no console.
+[[bin]]
+name = "vcam"
+path = "src/bin/vcam.rs"
+
+# Command line (port of `python vcam.py ...`).
+[[bin]]
+name = "vcam-cli"
+path = "src/bin/vcam-cli.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4.5", features = ["derive"] }
+ctrlc = "3.4"
+# Pinned: the egui API changes between minor versions.
+eframe = { version = "=0.31.1", default-features = false, features = ["glow", "default_fonts"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "webp"] }
+# ONNX Runtime binding. `load-dynamic` loads onnxruntime.dll at run time (nothing is
+# downloaded or linked at build time). `api-20` = works with ONNX Runtime 1.20 or newer,
+# which matches the onnxruntime-gpu 1.20.2 / CUDA 12.6 / cuDNN 9.5 set the Python app pins.
+# Pinned: this crate is still a release candidate and its API moves.
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "load-dynamic", "api-20", "cuda", "directml"] }
+rayon = "1.10"
+rfd = "0.15"
+serde_json = "1"
+sha2 = "0.10"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Media_MediaFoundation",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_Com_Urlmon",
+    "Win32_System_Memory",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+] }
+
+[build-dependencies]
+winresource = { version = "0.1", optional = true }
+
+[features]
+# Embed assets/icon.ico into the .exe files. Needs a resource compiler (rc.exe from the
+# Windows SDK with the MSVC toolchain, or windres with the GNU toolchain).
+exe-icon = ["dep:winresource"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+
+# Image loops are far too slow unoptimised; keep debug builds usable.
+[profile.dev]
+opt-level = 2

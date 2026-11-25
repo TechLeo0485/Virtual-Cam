@@ -1,0 +1,138 @@
+//! Output pipeline: compositing + virtual-cam send on their own thread.
+
+use crate::compositor::Compositor;
+use crate::engine::keep_largest;
+use crate::imgproc::Bgr;
+use crate::virtualcam::VirtualCam;
+use anyhow::{anyhow, Result};
+use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+
+/// One frame's worth of work for the output thread.
+pub struct Job {
+    /// A new compositor to switch to (the first job must carry one; later jobs carry
+    /// one only when the background changed).
+    pub compositor: Option<Compositor>,
+    /// The matted foreground (RVM) or the camera frame.
+    pub source: Bgr,
+    pub alpha: Vec<f32>,
+    /// Live zoom, applied by the render thread.
+    pub zoom: f32,
+    /// Live matte threshold (0 = off), applied by the render thread.
+    pub threshold: f32,
+    /// Keep only the largest person. Done here rather than on the inference thread,
+    /// so its 3-4 ms per frame overlap the next inference instead of adding to it.
+    pub single: bool,
+}
+
+/// What the output thread publishes for the UI.
+#[derive(Default)]
+pub struct OutputShared {
+    /// Most recently sent output frame (for preview); `None` until the first.
+    pub latest: Mutex<Option<Arc<Bgr>>>,
+    /// (x, y, w, h) of the camera inside the output, or `None` for an exact fit.
+    pub cam_rect: Mutex<Option<(usize, usize, usize, usize)>>,
+    pub error: Mutex<Option<String>>,
+}
+
+/// Runs compositing + virtual-cam send on a worker thread so that work overlaps the
+/// *next* frame's inference instead of waiting behind it.
+///
+/// The matte is a serial wall — each frame feeds the recurrent state into the next, so
+/// inferences can't overlap each other. But the compositing + send AFTER inference
+/// don't depend on the next frame, so doing them on a second thread hides them behind
+/// the next inference. Frames are handled in submit order and the output is identical
+/// to doing it inline — a pure throughput win, costing one extra frame of latency
+/// (imperceptible for a webcam).
+pub struct OutputPipeline {
+    tx: Option<SyncSender<Job>>,
+    done: Receiver<()>,
+    pub shared: Arc<OutputShared>,
+}
+
+impl OutputPipeline {
+    pub fn new(cam: Option<VirtualCam>, shared: Arc<OutputShared>) -> Result<OutputPipeline> {
+        // small queue => bounded latency + back-pressure
+        let (tx, rx) = mpsc::sync_channel::<Job>(2);
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let sh = shared.clone();
+        thread::Builder::new().name("vcam-output".into()).spawn(move || {
+            let mut cam = cam;
+            let mut compositor: Option<Compositor> = None;
+            while let Ok(mut job) = rx.recv() {
+                if sh.error.lock().map(|e| e.is_some()).unwrap_or(true) {
+                    continue; // drain quietly so submit() never blocks
+                }
+                if let Some(c) = job.compositor {
+                    compositor = Some(c);
+                }
+                let comp = match compositor.as_mut() {
+                    Some(c) => c,
+                    None => {
+                        if let Ok(mut e) = sh.error.lock() {
+                            *e = Some("output pipeline started without a compositor".to_string());
+                        }
+                        continue;
+                    }
+                };
+                if job.alpha.len() != job.source.w * job.source.h {
+                    if let Ok(mut e) = sh.error.lock() {
+                        *e = Some("matte size does not match the frame".to_string());
+                    }
+                    continue;
+                }
+                if job.single {
+                    keep_largest(&mut job.alpha, job.source.w, job.source.h);
+                }
+                let out = comp.render(&job.source, &job.alpha, job.zoom, job.threshold);
+                if let Some(cam) = cam.as_mut() {
+                    cam.send(out);
+                    cam.sleep_until_next_frame();
+                }
+                let shared_frame = Arc::new(out.clone());
+                let rect = comp.rect();
+                if let Ok(mut l) = sh.latest.lock() {
+                    *l = Some(shared_frame);
+                }
+                if let Ok(mut r) = sh.cam_rect.lock() {
+                    *r = rect;
+                }
+            }
+            drop(cam); // closes the virtual camera
+            let _ = done_tx.send(());
+        })?;
+        Ok(OutputPipeline { tx: Some(tx), done: done_rx, shared })
+    }
+
+    /// The worker's failure, if any.
+    pub fn error(&self) -> Option<String> {
+        self.shared.error.lock().ok().and_then(|e| e.clone())
+    }
+
+    /// Hand one frame's render+send to the worker. Blocks (back-pressure) if the worker
+    /// is two frames behind; fails if the worker has failed.
+    pub fn submit(&self, job: Job) -> Result<()> {
+        if let Some(e) = self.error() {
+            return Err(anyhow!("{}", e));
+        }
+        match self.tx.as_ref() {
+            Some(tx) => tx.send(job).map_err(|_| anyhow!("the output thread has stopped")),
+            None => Err(anyhow!("the output pipeline is closed")),
+        }
+    }
+
+    /// Drain and stop the worker (which also closes the virtual camera).
+    pub fn close(&mut self) {
+        if self.tx.take().is_some() {
+            let _ = self.done.recv_timeout(Duration::from_secs(2));
+        }
+    }
+}
+
+impl Drop for OutputPipeline {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
