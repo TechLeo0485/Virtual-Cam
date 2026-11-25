@@ -4,6 +4,9 @@
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=assets/icon.ico");
+    // The update checker's repository is baked in from these (see src/update.rs).
+    println!("cargo:rerun-if-env-changed=VCAM_UPDATE_REPO");
+    println!("cargo:rerun-if-env-changed=GITHUB_REPOSITORY");
     #[cfg(feature = "exe-icon")]
     {
         if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {

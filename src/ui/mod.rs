@@ -3,6 +3,7 @@
 pub mod app;
 pub mod settings;
 pub mod theme;
+pub mod tray;
 pub mod view;
 pub mod widgets;
 

@@ -101,6 +101,47 @@ fn init() -> Result<Environment, String> {
     Ok(env)
 }
 
+static CUDA_BLOCKING_SYNC: OnceLock<()> = OnceLock::new();
+
+/// Make a thread that waits for the GPU sleep instead of spin.
+///
+/// CUDA's default wait (`cudaDeviceScheduleAuto`) busy-spins the CPU thread when there are
+/// more CPU cores than GPUs, so the thread calling `Session::run` burned a CPU core for the
+/// whole time the GPU was working. Measured on a GTX 1050 Ti, 1280x720, ONNX Runtime 1.20.2:
+/// rvm_resnet50 27-38 ms of CPU per frame spinning vs 0.1-0.4 ms blocking, rvm_mobilenetv3
+/// 5.6-5.9 ms vs 0.1-0.4 ms, with the same frame time (31 / 96 ms) either way.
+///
+/// The flag must be set before the CUDA context exists, so this runs (once) before the
+/// first CUDA session is built. It calls `cudaSetDeviceFlags` in the same
+/// `cudart64_12.dll` the CUDA provider loads (found through the PATH set up by
+/// [`ort_env`]). Any failure only means the default (spinning) wait is kept.
+pub fn cuda_blocking_sync() {
+    CUDA_BLOCKING_SYNC.get_or_init(|| unsafe {
+        use windows::core::{s, w};
+        use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+        const CUDA_DEVICE_SCHEDULE_BLOCKING_SYNC: u32 = 0x04;
+        let lib = match LoadLibraryW(w!("cudart64_12.dll")) {
+            Ok(h) => h,
+            Err(e) => {
+                vlog!("[vcam] CUDA blocking sync not set: cudart64_12.dll not loaded ({})", e);
+                return;
+            }
+        };
+        let Some(proc) = GetProcAddress(lib, s!("cudaSetDeviceFlags")) else {
+            vlog!("[vcam] CUDA blocking sync not set: cudaSetDeviceFlags not found");
+            return;
+        };
+        // cudaError_t cudaSetDeviceFlags(unsigned int flags); 0 = cudaSuccess
+        let set_device_flags: unsafe extern "C" fn(u32) -> i32 = std::mem::transmute(proc);
+        let rc = set_device_flags(CUDA_DEVICE_SCHEDULE_BLOCKING_SYNC);
+        if rc == 0 {
+            vlog!("[vcam] CUDA: blocking sync on (no CPU spin while the GPU works)");
+        } else {
+            vlog!("[vcam] CUDA blocking sync not set: cudaSetDeviceFlags returned {}", rc);
+        }
+    });
+}
+
 /// The process-wide ONNX Runtime environment (loaded on first use).
 pub fn ort_env() -> Result<&'static Environment> {
     match ORT_ENV.get_or_init(init) {

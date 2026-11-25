@@ -9,8 +9,10 @@ use crate::imgproc::Bgr;
 use anyhow::{anyhow, bail, Result};
 use rayon::prelude::*;
 use std::path::Path;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
-use windows::core::{w, HSTRING};
+use windows::core::{s, w, HSTRING};
+use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::Win32::Foundation::{CloseHandle, BOOL, ERROR_SUCCESS, HANDLE, INVALID_HANDLE_VALUE};
 use windows::Win32::System::Memory::{
     CreateFileMappingW, MapViewOfFile, OpenFileMappingW, UnmapViewOfFile, FILE_MAP_ALL_ACCESS, FILE_MAP_READ,
@@ -233,6 +235,28 @@ impl VirtualCam {
         DEVICE_NAME
     }
 
+    /// (width, height) of the frames this queue carries.
+    pub fn size(&self) -> (usize, usize) {
+        (self.width, self.height)
+    }
+
+    /// How many video apps are reading the camera right now.
+    ///
+    /// OBS's virtual-camera filter opens the shared-memory queue only while an app is
+    /// streaming from it and closes it when the app turns the camera off, so the
+    /// section's handle count (all processes) minus our own handle is the number of
+    /// apps watching. An app that only lists cameras does not open it. Measured with a
+    /// DirectShow app on OBS 32.2: 1 -> 2 within 0.4 s of streaming, back to 1 at
+    /// release; while streaming it briefly reads 1 now and then (the filter reopens the
+    /// queue), so callers should wait a few seconds before treating 0 as "nobody".
+    /// Returns 1 when the count can't be read, so vcam never stops a camera in use.
+    pub fn consumers(&self) -> usize {
+        match section_handle_count(self.handle) {
+            Some(n) => n.saturating_sub(1) as usize,
+            None => 1,
+        }
+    }
+
     /// Send one frame (it must have the camera's size).
     pub fn send(&mut self, frame: &Bgr) {
         if frame.w != self.width || frame.h != self.height {
@@ -295,6 +319,45 @@ impl Drop for VirtualCam {
             let _ = CloseHandle(self.handle);
         }
     }
+}
+
+/// `PUBLIC_OBJECT_BASIC_INFORMATION` (NtQueryObject class 0).
+#[repr(C)]
+struct ObjectBasicInformation {
+    attributes: u32,
+    granted_access: u32,
+    handle_count: u32,
+    pointer_count: u32,
+    reserved: [u32; 10],
+}
+
+type NtQueryObjectFn = unsafe extern "system" fn(HANDLE, u32, *mut core::ffi::c_void, u32, *mut u32) -> i32;
+
+/// Number of open handles to the kernel object behind `handle`, in every process.
+fn section_handle_count(handle: HANDLE) -> Option<u32> {
+    static NT_QUERY_OBJECT: OnceLock<Option<NtQueryObjectFn>> = OnceLock::new();
+    let query = (*NT_QUERY_OBJECT.get_or_init(|| unsafe {
+        let ntdll = GetModuleHandleW(w!("ntdll.dll")).ok()?;
+        let proc = GetProcAddress(ntdll, s!("NtQueryObject"))?;
+        Some(std::mem::transmute::<unsafe extern "system" fn() -> isize, NtQueryObjectFn>(proc))
+    }))?;
+    let mut info = ObjectBasicInformation {
+        attributes: 0,
+        granted_access: 0,
+        handle_count: 0,
+        pointer_count: 0,
+        reserved: [0; 10],
+    };
+    let status = unsafe {
+        query(
+            handle,
+            0, // ObjectBasicInformation
+            &mut info as *mut ObjectBasicInformation as *mut core::ffi::c_void,
+            std::mem::size_of::<ObjectBasicInformation>() as u32,
+            std::ptr::null_mut(),
+        )
+    };
+    (status >= 0).then_some(info.handle_count)
 }
 
 /// BGR -> NV12 with the BT.601 limited-range integer coefficients libyuv uses

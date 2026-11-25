@@ -1,6 +1,6 @@
 [package]
 name = "vcam"
-version = "0.1.0"
+version = "0.9.0"
 edition = "2021"
 description = "Real-time webcam virtual background (RobustVideoMatting) published as a system virtual camera. Rust port of vcam.py / vcam_ui.py."
 default-run = "vcam"
@@ -36,6 +36,8 @@ rayon = "1.10"
 rfd = "0.15"
 serde_json = "1"
 sha2 = "0.10"
+# System-tray icon + its right-click menu (control panel only).
+tray-icon = "0.19"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
@@ -44,9 +46,11 @@ windows = { version = "0.58", features = [
     "Win32_Security",
     "Win32_System_Com",
     "Win32_System_Com_Urlmon",
+    "Win32_System_LibraryLoader",
     "Win32_System_Memory",
     "Win32_System_Registry",
     "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [build-dependencies]

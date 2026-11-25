@@ -144,9 +144,17 @@ struct Args {
     #[arg(long)]
     no_virtualcam: bool,
 
+    /// run the webcam only while an app uses the virtual camera (standby otherwise)
+    #[arg(long, conflicts_with = "no_virtualcam")]
+    on_demand: bool,
+
     /// list the cameras and exit
     #[arg(long)]
     list_cameras: bool,
+
+    /// look for a newer release on GitHub, then exit
+    #[arg(long)]
+    check_update: bool,
 
     /// make sure every model exists in DIR (copying or downloading), then exit
     #[arg(long, value_name = "DIR")]
@@ -208,6 +216,16 @@ impl eframe::App for PreviewApp {
 }
 
 fn run(args: Args) -> anyhow::Result<i32> {
+    if args.check_update {
+        use vcam::update::{is_newer, latest_release, VERSION};
+        let latest = latest_release()?;
+        if is_newer(&latest.version, VERSION) {
+            println!("Update available: {} (running {})\n{}", latest.version, VERSION, latest.url);
+        } else {
+            println!("vcam {} is up to date (latest release: {}).", VERSION, latest.version);
+        }
+        return Ok(0);
+    }
     if let Some(dir) = args.download_models.as_ref() {
         let n = models::bundle_all_models(dir)?;
         println!("[build] bundled {} model files into {}", n, dir.display());
@@ -266,6 +284,7 @@ fn run(args: Args) -> anyhow::Result<i32> {
         c.zoom = args.zoom;
         c.threshold = args.threshold.clamp(0.0, vcam::compositor::THRESHOLD_MAX);
         c.vcam = if args.no_virtualcam { VcamMode::Disabled } else { VcamMode::Optional };
+        c.on_demand = args.on_demand;
     });
 
     let quit = Arc::new(AtomicBool::new(false));

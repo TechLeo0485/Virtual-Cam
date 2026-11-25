@@ -1,0 +1,70 @@
+# Publishes a GitHub Release when a version tag is pushed:
+#
+#   1. set `version = "X.Y.Z"` in Cargo.toml (and commit it)
+#   2. git tag vX.Y.Z && git push origin vX.Y.Z
+#
+# The run fails if the tag and Cargo.toml disagree. It builds, runs the tests, and
+# attaches vcam-X.Y.Z-windows-x64.zip (vcam.exe, vcam-cli.exe, assets, README) to a
+# new release with generated notes. Running copies of vcam find it through their update
+# check (src/update.rs). The zip holds the program only: unzip it over an existing
+# release\vcam\ folder, which already has the models and the ONNX Runtime / CUDA DLLs.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # create the release
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the tag matches Cargo.toml
+        id: ver
+        shell: bash
+        run: |
+          crate=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$crate" != "$tag" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $crate"
+            exit 1
+          fi
+          echo "version=$crate" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust (stable, MSVC)
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build (release)
+        shell: bash
+        run: cargo build --release --features exe-icon || cargo build --release
+
+      - name: Unit tests
+        shell: bash
+        run: cargo test --release
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $name = "vcam-${{ steps.ver.outputs.version }}-windows-x64"
+          New-Item -ItemType Directory -Force "dist/vcam" | Out-Null
+          Copy-Item target/release/vcam.exe, target/release/vcam-cli.exe, README.md "dist/vcam/"
+          Copy-Item -Recurse assets "dist/vcam/assets"
+          Compress-Archive -Path "dist/vcam" -DestinationPath "dist/$name.zip"
+          "ZIP=dist/$name.zip" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - name: Publish the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" "$ZIP" --title "vcam $GITHUB_REF_NAME" --generate-notes

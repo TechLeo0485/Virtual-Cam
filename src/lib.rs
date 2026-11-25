@@ -28,6 +28,7 @@ pub mod models;
 pub mod pipeline;
 pub mod power;
 pub mod ui;
+pub mod update;
 pub mod util;
 pub mod virtualcam;
 pub mod worker;

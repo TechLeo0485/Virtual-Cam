@@ -26,8 +26,42 @@ which Google Meet, Zoom, Teams, Discord and OBS can select like a normal webcam.
 | `src/virtualcam.rs` | OBS Virtual Camera output (shared-memory queue), install / uninstall, status. |
 | `src/models.rs` | Model registry, lookup and download. |
 | `src/ui/` | The egui control panel (`app.rs`), its look (`theme.rs`, `widgets.rs`), settings file, preview rendering. |
-| `build.cmd` | Release build + bundle into `release\vcam\`. |
+| `build.cmd` | Local release build + bundle into `release\vcam\` (needs Rust). |
+| `.github/workflows/build.yml` | Cloud build on GitHub Actions (no Rust needed locally). |
+| `.github/workflows/release.yml` | Publishes a GitHub Release when a `vX.Y.Z` tag is pushed. |
+| `src/update.rs` | Update check against the GitHub Releases. |
+
 ## Build
+
+### In the cloud (no Rust on your PC)
+
+`.github/workflows/build.yml` compiles the exes on GitHub's Windows servers.
+
+1. Push this repository to GitHub. Every push to `main` starts a build; you can also
+   start one from the **Actions** tab -> **build** -> **Run workflow**.
+2. When the run is green, open it and download **vcam-windows** under *Artifacts*.
+3. Unzip it and copy `vcam.exe` and `vcam-cli.exe` into `release\vcam\`, replacing the
+   old ones. The models and the ONNX Runtime / CUDA DLLs already there are reused.
+
+### Releases and the update check
+
+The version lives in `Cargo.toml` (`version = "0.9.0"`). To publish a release:
+
+1. Set the new version in `Cargo.toml` and commit it.
+2. Tag and push the tag: `git tag v0.9.1` then `git push origin v0.9.1`.
+3. `.github/workflows/release.yml` checks that the tag matches `Cargo.toml`, builds, runs
+   the tests and publishes **vcam-0.9.1-windows-x64.zip** on the repository's Releases
+   page. Unzip it over `release\vcam\` (the models and DLLs there are reused).
+
+The control panel checks GitHub for a newer release at start and every 12 hours. The
+footer shows `vcam 0.9.0 · up to date`, or an **Update available** button that opens the
+release page; `vcam-cli --check-update` does the same from the command line. The
+repository to check is baked in at build time from `GITHUB_REPOSITORY`, which GitHub
+Actions sets (set `VCAM_UPDATE_REPO=owner/name` for a local build). A build without it
+never checks. GitHub answers only for a public repository; with a private one the check
+reports "failed".
+
+### Locally (needs Rust)
 
 1. Install Rust from <https://rustup.rs>. Either toolchain works:
    - `stable-x86_64-pc-windows-msvc` (the default; needs the Visual Studio C++ Build Tools), or
@@ -52,6 +86,23 @@ target\release\vcam-cli.exe --blur      :: command line
 target\release\vcam-cli.exe --background ..\vb\2.png
 target\release\vcam.exe --selftest      :: checks ONNX Runtime + RVM, writes vcam_selftest.txt
 ```
+
+### Tray and on-demand mode
+
+- **Tray.** Closing the control panel hides it to the system tray; vcam keeps serving the
+  virtual camera. Left-click the tray icon (or **Open vcam** in its menu) to bring the
+  window back; **Quit vcam** turns everything off and exits. `vcam.exe --tray` starts
+  hidden in the tray, for example from a shortcut in the Startup folder
+  (`shell:startup`).
+- **Only run while an app uses the camera** (card 2, on by default). vcam starts armed:
+  "OBS Virtual Camera" is published with a black frame, and the webcam and the model stay
+  off (standby, about 0 CPU). When Meet, Zoom, Teams... turn the camera on, vcam starts
+  the webcam and the model (the app sees black for the few seconds this takes); 5 seconds
+  after the last app turns it off, it goes back to standby. The command line has the
+  same mode: `vcam-cli --on-demand`.
+- How "an app is using it" is detected: OBS's virtual-camera filter opens vcam's
+  shared-memory queue only while an app streams from it, so vcam counts the handles
+  open on that queue. An app that merely lists cameras doesn't count.
 
 `vcam-cli --help` lists all flags. They follow the Python CLI without the MediaPipe ones
 (`--engine`, `--feather`, `--edge-radius`, `--erode`, `--temporal`, `--mask-scale`).
@@ -90,6 +141,10 @@ target\release\vcam.exe --selftest      :: checks ONNX Runtime + RVM, writes vca
   than the camera) the frame is shrunk before matting, and the Quality ratio is scaled up
   to match, so the coarse pass keeps its resolution. On a GTX 1050 Ti at Balanced:
   about 25 fps at zoom 1.0, 27.5 at 1.5, 30 at 2.0.
+- **No CPU spin while the GPU works.** With CUDA, vcam sets `cudaDeviceScheduleBlockingSync`
+  before the first session, so the thread waiting for the GPU sleeps. CUDA's default spun
+  it: 27-38 ms of CPU per frame with rvm_resnet50 (about half a core at 10-30 fps), now
+  under 0.5 ms, at the same frame rate.
 - **Rayon uses at most 4 worker threads** (`RAYON_NUM_THREADS` overrides it). The default
   of one per logical CPU spun idle workers and cost about 4 CPU cores.
 - **Camera capture uses Media Foundation**, not DirectShow. Camera index order can

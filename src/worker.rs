@@ -76,6 +76,10 @@ pub struct Config {
     /// Matte threshold, 0 = off (see `Compositor::set_threshold`). Live.
     pub threshold: f32,
     pub vcam: VcamMode,
+    /// Run the webcam and the model only while a video app is using the virtual camera.
+    /// In between, the virtual camera stays published with a black frame (standby).
+    /// Needs the virtual camera (ignored with `VcamMode::Disabled`).
+    pub on_demand: bool,
 }
 
 impl Default for Config {
@@ -105,6 +109,7 @@ impl Default for Config {
             zoom: 1.0,
             threshold: 0.0,
             vcam: VcamMode::Required,
+            on_demand: false,
         }
     }
 }
@@ -126,6 +131,21 @@ impl Config {
             || self.rotation != other.rotation
             || self.model != other.model
             || self.vcam != other.vcam
+            || self.on_demand != other.on_demand
+    }
+
+    /// True when this config runs the camera only while an app is watching.
+    fn standby_enabled(&self) -> bool {
+        self.on_demand && self.vcam != VcamMode::Disabled
+    }
+
+    /// The virtual-camera size in on-demand mode. It must be known before the webcam is
+    /// opened (the queue stays open across sessions), so it is the output size when one
+    /// is set, else the requested capture size.
+    fn on_demand_size(&self) -> (usize, usize) {
+        let w = self.out_width.filter(|v| *v > 0).unwrap_or(self.width) as usize;
+        let h = self.out_height.filter(|v| *v > 0).unwrap_or(self.height) as usize;
+        ((w & !1).max(2), (h & !1).max(2))
     }
 
     fn engine_params(&self) -> EngineParams {
@@ -141,10 +161,17 @@ impl Config {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RunState {
     Stopped,
+    /// On-demand mode, no app watching: the virtual camera is published, the webcam
+    /// and the model are off.
+    Standby,
     Starting,
     Running,
     Error,
 }
+
+/// On-demand mode: how long no app may be watching before the webcam and the model are
+/// turned off. Rides out the brief drops of the consumer count while an app streams.
+const IDLE_STOP: Duration = Duration::from_secs(5);
 
 /// A snapshot of the worker for the UI.
 #[derive(Clone, Debug)]
@@ -400,14 +427,31 @@ fn worker_loop(inner: &Arc<Inner>) {
     // (camera/resolution/engine) requests a reconnect, then rebuilds — so the user can
     // change any option without clicking OFF/ON.
     let mut failure: Option<String> = None;
+    // On-demand mode keeps the virtual camera open between sessions: a video app holds
+    // the queue while it streams, so closing and re-creating it would fail.
+    let mut keep: Option<VirtualCam> = None;
     while !inner.stop.load(Ordering::SeqCst) {
         inner.restart.store(false, Ordering::SeqCst);
+        let cfg = inner.cfg.lock().unwrap().clone();
+        if cfg.standby_enabled() {
+            match standby(inner, &cfg, &mut keep) {
+                Ok(true) => {} // an app opened the camera
+                Ok(false) => continue, // stop, or a setting changed
+                Err(e) => {
+                    failure = Some(e.to_string());
+                    break;
+                }
+            }
+        } else {
+            keep = None;
+        }
         inner.status.lock().unwrap().state = RunState::Starting;
-        if let Err(e) = run_session(inner) {
+        if let Err(e) = run_session(inner, &mut keep) {
             failure = Some(e.to_string());
             break;
         }
     }
+    drop(keep); // closes the virtual camera
     *inner.raw.lock().unwrap() = None;
     *inner.output.lock().unwrap() = None;
     let mut st = inner.status.lock().unwrap();
@@ -424,8 +468,50 @@ fn worker_loop(inner: &Arc<Inner>) {
     }
 }
 
-fn run_session(inner: &Arc<Inner>) -> Result<()> {
+/// On-demand mode: publish the virtual camera with a black frame (no webcam, no model)
+/// and wait until a video app opens it. `Ok(true)` = an app is watching; `Ok(false)` =
+/// stop or a setting change was requested.
+fn standby(inner: &Arc<Inner>, cfg: &Config, keep: &mut Option<VirtualCam>) -> Result<bool> {
+    let (w, h) = cfg.on_demand_size();
+    if keep.as_ref().is_some_and(|c| c.size() != (w, h)) {
+        *keep = None; // output size changed while idle
+    }
+    if keep.is_none() {
+        *keep = Some(VirtualCam::open(w, h, cfg.fps as f64)?);
+    }
+    let cam = keep.as_mut().expect("opened above");
+    *inner.output.lock().unwrap() = None; // no preview while idle
+    *inner.raw.lock().unwrap() = None;
+    {
+        let mut st = inner.status.lock().unwrap();
+        st.state = RunState::Standby;
+        st.running = true;
+        st.fps = 0.0;
+        st.device = Some(cam.device().to_string());
+        st.out_size = Some((w, h));
+        st.cam_rect = None;
+    }
+    vlog!("[vcam] Standby: the webcam starts when an app uses '{}'", cam.device());
+    let black = Bgr::new(w, h);
+    let mut last_send: Option<Instant> = None;
+    while !inner.stop.load(Ordering::SeqCst) && !inner.restart.load(Ordering::SeqCst) {
+        if cam.consumers() > 0 {
+            vlog!("[vcam] An app opened the virtual camera -> starting");
+            return Ok(true);
+        }
+        // One frame a second keeps the camera visible to apps (OBS repeats it).
+        if last_send.map_or(true, |t| t.elapsed() >= Duration::from_secs(1)) {
+            cam.send(&black);
+            last_send = Some(Instant::now());
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    Ok(false)
+}
+
+fn run_session(inner: &Arc<Inner>, keep: &mut Option<VirtualCam>) -> Result<()> {
     let cfg = inner.cfg.lock().unwrap().clone();
+    let on_demand = cfg.standby_enabled();
     let rot = normalize_rotation(cfg.rotation as i64)?;
     let grabber = FrameGrabber::start(cfg.camera, cfg.width, cfg.height, cfg.fps, rot)?;
     let (raw_w, raw_h) = grabber.size(); // the full camera frame, 90/270 already swapped
@@ -448,9 +534,12 @@ fn run_session(inner: &Arc<Inner>) -> Result<()> {
     // inside it (never clipped); a crop keeps the size it has in that full frame, so
     // cropping only drops pixels and never enlarges the rest. Zoom scales from there.
     // The rest of the canvas is filled with the background.
-    let out_set = cfg.out_width.filter(|v| *v > 0).is_some() && cfg.out_height.filter(|v| *v > 0).is_some();
-    let out_w = cfg.out_width.map(|v| v as usize).filter(|v| *v > 0).unwrap_or(width);
-    let out_h = cfg.out_height.map(|v| v as usize).filter(|v| *v > 0).unwrap_or(height);
+    // On demand, the size is fixed up front (the virtual camera is already open).
+    let demand_size = if on_demand { Some(cfg.on_demand_size()) } else { None };
+    let out_set = demand_size.is_some()
+        || (cfg.out_width.filter(|v| *v > 0).is_some() && cfg.out_height.filter(|v| *v > 0).is_some());
+    let out_w = demand_size.map(|s| s.0).unwrap_or_else(|| cfg.out_width.map(|v| v as usize).filter(|v| *v > 0).unwrap_or(width));
+    let out_h = demand_size.map(|s| s.1).unwrap_or_else(|| cfg.out_height.map(|v| v as usize).filter(|v| *v > 0).unwrap_or(height));
     if (out_w, out_h) != (width, height) {
         vlog!("[vcam] Scaling output to {}x{}", out_w, out_h);
     }
@@ -460,7 +549,13 @@ fn run_session(inner: &Arc<Inner>) -> Result<()> {
     inner.bg_dirty.store(false, Ordering::SeqCst);
     let mut pending_compositor = Some(compositor);
 
+    // Reuse the virtual camera standby kept open, when it has the right size.
+    let reused = match keep.take() {
+        Some(c) if c.size() == (out_w, out_h) && cfg.vcam != VcamMode::Disabled => Some(c),
+        _ => None,
+    };
     let cam = match cfg.vcam {
+        _ if reused.is_some() => reused,
         VcamMode::Disabled => None,
         VcamMode::Required => Some(VirtualCam::open(out_w, out_h, cfg.fps as f64)?),
         VcamMode::Optional => match VirtualCam::open(out_w, out_h, cfg.fps as f64) {
@@ -502,10 +597,19 @@ fn run_session(inner: &Arc<Inner>) -> Result<()> {
     let t0 = Instant::now();
     let mut last_seq: u64 = 0;
     let mut ones: Vec<f32> = Vec::new();
+    let mut last_watched = Instant::now();
     let result = (|| -> Result<()> {
         while !inner.stop.load(Ordering::SeqCst) && !inner.restart.load(Ordering::SeqCst) {
             if let Some(e) = pipeline.error() {
                 bail!("{}", e);
+            }
+            if on_demand {
+                if pipeline.shared.consumers.load(Ordering::Relaxed) > 0 {
+                    last_watched = Instant::now();
+                } else if last_watched.elapsed() >= IDLE_STOP {
+                    vlog!("[vcam] No app is using the virtual camera -> standby");
+                    break;
+                }
             }
             let (seq, frame) = grabber.read();
             let raw = match frame {
@@ -600,7 +704,12 @@ fn run_session(inner: &Arc<Inner>) -> Result<()> {
     })();
 
     grabber.stop();
-    pipeline.close(); // drain + join the output thread, which closes the virtual cam
+    // Drain + join the output thread. On demand, keep the virtual camera open for the
+    // next standby; otherwise dropping it closes it.
+    let cam_back = pipeline.close();
+    if on_demand {
+        *keep = cam_back;
+    }
     drop(engine);
     {
         let mut st = inner.status.lock().unwrap();

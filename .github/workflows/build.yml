@@ -1,0 +1,52 @@
+# Builds vcam.exe and vcam-cli.exe on GitHub's Windows servers, so no Rust
+# toolchain is needed on your own PC.
+#
+# Runs on every push to main, and on demand from the Actions tab ("Run workflow").
+# Download the result from the run's page -> Artifacts -> "vcam-windows", unzip it,
+# and copy the two exes into release\vcam\ (which already holds the models and the
+# ONNX Runtime / CUDA DLLs; those are not rebuilt here).
+
+name: build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable, MSVC)
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build (release)
+        shell: bash
+        # Embed the exe icon when the resource compiler works; otherwise build without it.
+        run: cargo build --release --features exe-icon || cargo build --release
+
+      - name: Unit tests
+        shell: bash
+        run: cargo test --release
+
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/release/vcam.exe target/release/vcam-cli.exe dist/
+          cp -r assets dist/assets
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vcam-windows
+          path: dist/
+          retention-days: 30

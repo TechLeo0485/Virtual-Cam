@@ -93,7 +93,7 @@ fn sha256_hex(path: &Path) -> Result<String> {
 }
 
 /// Download `url` to `dest` (follows redirects, uses the system proxy settings).
-fn download(url: &str, dest: &Path) -> Result<()> {
+pub(crate) fn download(url: &str, dest: &Path) -> Result<()> {
     use windows::core::{IUnknown, HSTRING};
     use windows::Win32::System::Com::IBindStatusCallback;
     use windows::Win32::System::Com::Urlmon::URLDownloadToFileW;

@@ -8,6 +8,7 @@
 
 use super::settings::{Settings, CROP_MIN};
 use super::theme::{self, ThemeChoice};
+use super::tray;
 use super::view::fit_in_box;
 use super::widgets as w;
 use super::*;
@@ -18,6 +19,7 @@ use crate::compositor::THRESHOLD_MAX;
 use crate::geometry::{crop_pixels, ZOOM_MAX, ZOOM_MIN};
 use crate::imgproc;
 use crate::models;
+use crate::update::{self, UpdateChecker, UpdateState};
 use crate::virtualcam;
 use crate::worker::{BgMode, RunState, Status, VCamWorker, VcamMode};
 use eframe::egui::{self, Color32, CornerRadius, Pos2, Rect, Sense, Stroke, StrokeKind, TextureHandle, TextureOptions, Vec2};
@@ -46,7 +48,18 @@ enum CropDrag {
 }
 
 pub struct VcamApp {
-    worker: VCamWorker,
+    /// Shared with the tray menu ("Quit vcam" stops it).
+    worker: Arc<VCamWorker>,
+    /// Webcam only while an app uses the virtual camera (see `Config::on_demand`).
+    on_demand: bool,
+    /// The tray icon exists: closing the window hides it there instead of quitting.
+    in_tray: bool,
+    /// `--tray`: hide to the tray once the window is up (eframe shows the window only
+    /// after its first frame, so hiding on frame 1 would be undone).
+    start_hidden: bool,
+    frames_drawn: u32,
+    /// GitHub Releases check (footer).
+    updates: UpdateChecker,
     // options
     cam_idx: usize,
     bg_enabled: bool,
@@ -135,7 +148,12 @@ impl VcamApp {
             crate::util::find_near_exe("2.png").filter(|p| p.is_file()).map(|p| p.to_string_lossy().into_owned())
         });
         let mut app = VcamApp {
-            worker: VCamWorker::new(),
+            worker: Arc::new(VCamWorker::new()),
+            on_demand: settings.on_demand,
+            in_tray: false,
+            start_hidden: false,
+            frames_drawn: 0,
+            updates: UpdateChecker::start(),
             cam_idx: 0,
             bg_enabled: settings.bg_enabled,
             blur_image: false,
@@ -183,6 +201,11 @@ impl VcamApp {
         if let Some(folder) = app.gal_folder.clone() {
             app.load_folder(Some(folder));
         }
+        if app.on_demand && virtualcam::virtualcam_installed() {
+            // Arm at launch: the virtual camera is published right away, and the
+            // webcam starts only when an app turns it on.
+            app.toggle();
+        }
         app
     }
 
@@ -222,6 +245,7 @@ impl VcamApp {
             threshold: self.threshold,
             show_bounds: self.show_bounds,
             theme: self.theme,
+            on_demand: self.on_demand,
         }
         .save();
     }
@@ -316,6 +340,7 @@ impl VcamApp {
             c.out_width = Some(self.out_res.0);
             c.out_height = Some(self.out_res.1);
             c.vcam = VcamMode::Required;
+            c.on_demand = self.on_demand;
         });
         self.worker.start();
     }
@@ -527,14 +552,20 @@ impl VcamApp {
         let on = st.running || st.state == RunState::Starting;
         let (run_text, run_tone) = match st.state {
             RunState::Running if st.running => ("Running", w::Tone::Ok),
+            RunState::Standby => ("Standby \u{2014} the webcam starts when an app uses the camera", w::Tone::Ok),
             RunState::Starting | RunState::Running => ("Starting\u{2026}", w::Tone::Warn),
             RunState::Error => ("Error (see below the preview)", w::Tone::Error),
             RunState::Stopped => ("Stopped", w::Tone::Muted),
         };
         let cameras = self.cameras.clone();
+        let mut on_demand = self.on_demand;
         w::card(ui, "2. Camera on / off", |ui| {
             toggle_clicked = w::primary_button(ui, if on { "Turn OFF" } else { "Turn ON" }, on).clicked();
             w::status(ui, run_tone, run_text);
+            ui.checkbox(&mut on_demand, "Only run while an app uses the camera").on_hover_text(
+                "The webcam and the model start when Meet, Zoom, Teams... turn on \"OBS Virtual \
+                 Camera\", and stop 5 seconds after they turn it off. vcam starts armed.",
+            );
             w::field_row(ui, "Camera", |ui| {
                 let count = if cameras.is_empty() { 9 } else { cameras.len().max(cam_idx + 1) };
                 let r = w::combo(ui, "camera", &Self::camera_label(&cameras, cam_idx), |ui| {
@@ -552,6 +583,12 @@ impl VcamApp {
         }
         if toggle_clicked {
             self.toggle();
+        }
+        if on_demand != self.on_demand {
+            // Switches between standby and always-on (the worker reconnects).
+            self.on_demand = on_demand;
+            self.worker.configure(|c| c.on_demand = on_demand);
+            self.save_settings();
         }
         if cam_idx != self.cam_idx {
             // Camera index change -> worker reopens the device (auto reconnect).
@@ -830,6 +867,10 @@ impl VcamApp {
                 }
                 text
             }
+            RunState::Standby => format!(
+                "Waiting \u{2014} turn on \"{}\" in Meet, Zoom, Teams...",
+                st.device.clone().unwrap_or_default()
+            ),
             RunState::Error => st.error.clone().unwrap_or_default(),
             _ => String::new(),
         }
@@ -1245,7 +1286,18 @@ impl eframe::App for VcamApp {
         self.poll_vcam_action();
         let st = self.worker.status();
 
-        if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close {
+        self.frames_drawn = self.frames_drawn.saturating_add(1);
+        if self.start_hidden && self.frames_drawn >= 3 {
+            self.start_hidden = false;
+            tray::hide_window();
+        } else if self.start_hidden {
+            ctx.request_repaint(); // get to frame 3 right away
+        }
+        if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close && self.in_tray {
+            // The X hides to the tray; "Quit vcam" in the tray menu exits.
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            tray::hide_window();
+        } else if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close {
             let msg = if st.running { "The virtual camera is ON \u{2014} quit and turn it off?" } else { "Quit vcam?" };
             let answer = rfd::MessageDialog::new()
                 .set_level(rfd::MessageLevel::Info)
@@ -1261,6 +1313,12 @@ impl eframe::App for VcamApp {
             }
         }
 
+        if tray::is_hidden() {
+            // In the tray: nothing to draw; just look in now and then.
+            ctx.request_repaint_after(Duration::from_millis(500));
+            return;
+        }
+
         let (f11, esc) = ctx.input(|i| (i.key_pressed(egui::Key::F11), i.key_pressed(egui::Key::Escape)));
         if f11 || (esc && self.full_view) {
             self.set_full_view(ctx, !self.full_view);
@@ -1274,8 +1332,32 @@ impl eframe::App for VcamApp {
         }
 
         let mut theme_choice = self.theme;
+        let update_state = self.updates.state();
+        let mut check_clicked = false;
+        let mut open_url: Option<String> = None;
         egui::TopBottomPanel::bottom("footer").show(ctx, |ui| {
             ui.add_space(3.0);
+            ui.horizontal(|ui| {
+                w::hint(ui, &format!("vcam {}", update::VERSION));
+                match &update_state {
+                    UpdateState::Disabled => {}
+                    UpdateState::Checking => w::hint(ui, "\u{b7} checking for updates\u{2026}"),
+                    UpdateState::UpToDate => {
+                        w::hint(ui, "\u{b7} up to date");
+                        check_clicked = ui.small_button("Check again").clicked();
+                    }
+                    UpdateState::Failed(e) => {
+                        w::hint(ui, "\u{b7} update check failed");
+                        check_clicked = ui.small_button("Retry").on_hover_text(e.as_str()).clicked();
+                    }
+                    UpdateState::Available(r) => {
+                        let text = format!("\u{2b07} Update available: v{} \u{2014} download", r.version);
+                        if ui.button(text).on_hover_text(r.url.as_str()).clicked() {
+                            open_url = Some(r.url.clone());
+                        }
+                    }
+                }
+            });
             ui.horizontal(|ui| {
                 w::hint(ui, "In Google Meet: Settings \u{25b8} Video \u{25b8} Camera \u{25b8} \"OBS Virtual Camera\"");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1289,6 +1371,12 @@ impl eframe::App for VcamApp {
             });
             ui.add_space(3.0);
         });
+        if check_clicked {
+            self.updates.check_now();
+        }
+        if let Some(url) = open_url {
+            update::open_in_browser(&url);
+        }
         if theme_choice != self.theme {
             self.theme = theme_choice;
             theme::apply(ctx, theme_choice);
@@ -1306,14 +1394,17 @@ impl eframe::App for VcamApp {
         });
 
         // Keep the preview and status moving; the camera keeps running regardless.
-        ctx.request_repaint_after(Duration::from_millis(40));
+        // Nothing moves in standby or when stopped, so redraw less often then.
+        let busy = matches!(st.state, RunState::Running | RunState::Starting);
+        ctx.request_repaint_after(Duration::from_millis(if busy { 40 } else { 250 }));
     }
 }
 
-/// Run the control panel (blocks until the window is closed).
-pub fn run() -> anyhow::Result<()> {
+/// Run the control panel (blocks until the window is closed, or "Quit vcam" in the
+/// tray). `start_hidden` (`--tray`) starts in the tray.
+pub fn run(start_hidden: bool) -> anyhow::Result<()> {
     let mut viewport = egui::ViewportBuilder::default()
-        .with_title("vcam \u{2014} Virtual Camera")
+        .with_title(tray::WINDOW_TITLE)
         .with_inner_size([940.0, 800.0])
         .with_min_inner_size([760.0, 560.0]);
     if let Some(icon) = load_icon() {
@@ -1321,12 +1412,14 @@ pub fn run() -> anyhow::Result<()> {
     }
     let options = eframe::NativeOptions { viewport, ..Default::default() };
     eframe::run_native(
-        "vcam \u{2014} Virtual Camera",
+        tray::WINDOW_TITLE,
         options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             theme::install(&cc.egui_ctx);
-            let app = VcamApp::new(cc);
+            let mut app = VcamApp::new(cc);
             theme::apply(&cc.egui_ctx, app.theme);
+            app.in_tray = tray::create(app.worker.clone());
+            app.start_hidden = start_hidden && app.in_tray;
             Ok(Box::new(app))
         }),
     )

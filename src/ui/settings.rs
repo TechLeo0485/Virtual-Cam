@@ -28,6 +28,8 @@ pub struct Settings {
     pub show_bounds: bool,
     /// Dark, Light, or follow Windows (the Python app ignores this key)
     pub theme: ThemeChoice,
+    /// Run the webcam only while an app uses the virtual camera (standby otherwise).
+    pub on_demand: bool,
 }
 
 impl Default for Settings {
@@ -44,6 +46,7 @@ impl Default for Settings {
             threshold: 0.0,
             show_bounds: true,
             theme: ThemeChoice::System,
+            on_demand: true,
         }
     }
 }
@@ -117,6 +120,9 @@ impl Settings {
         if let Some(t) = v.get("theme").and_then(|x| x.as_str()) {
             s.theme = ThemeChoice::from_key(t);
         }
+        if let Some(b) = v.get("on_demand").and_then(|x| x.as_bool()) {
+            s.on_demand = b;
+        }
         s
     }
 
@@ -135,6 +141,7 @@ impl Settings {
             "threshold": ((self.threshold as f64) * 100.0).round() / 100.0,
             "show_bounds": self.show_bounds,
             "theme": self.theme.key(),
+            "on_demand": self.on_demand,
         });
         let path = settings_path();
         if let Some(dir) = path.parent() {

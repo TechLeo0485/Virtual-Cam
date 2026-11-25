@@ -71,7 +71,9 @@ fn main() {
     }
     // Keep matting at full speed when the window is minimized or covered.
     vcam::power::disable_power_throttling();
-    if let Err(e) = vcam::ui::app::run() {
+    // `--tray`: start hidden in the system tray (e.g. from a Windows startup shortcut).
+    let start_hidden = std::env::args().any(|a| a == "--tray");
+    if let Err(e) = vcam::ui::app::run(start_hidden) {
         vcam::vlog!("[vcam] UI error: {}", e);
         rfd::MessageDialog::new()
             .set_level(rfd::MessageLevel::Error)

@@ -5,6 +5,7 @@ use crate::engine::keep_largest;
 use crate::imgproc::Bgr;
 use crate::virtualcam::VirtualCam;
 use anyhow::{anyhow, Result};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -35,6 +36,9 @@ pub struct OutputShared {
     /// (x, y, w, h) of the camera inside the output, or `None` for an exact fit.
     pub cam_rect: Mutex<Option<(usize, usize, usize, usize)>>,
     pub error: Mutex<Option<String>>,
+    /// Video apps reading the virtual camera (see `VirtualCam::consumers`), refreshed
+    /// every few frames; 0 until the first check.
+    pub consumers: AtomicUsize,
 }
 
 /// Runs compositing + virtual-cam send on a worker thread so that work overlaps the
@@ -48,7 +52,8 @@ pub struct OutputShared {
 /// (imperceptible for a webcam).
 pub struct OutputPipeline {
     tx: Option<SyncSender<Job>>,
-    done: Receiver<()>,
+    /// The output thread hands the virtual camera back here when it ends.
+    done: Receiver<Option<VirtualCam>>,
     pub shared: Arc<OutputShared>,
 }
 
@@ -56,11 +61,12 @@ impl OutputPipeline {
     pub fn new(cam: Option<VirtualCam>, shared: Arc<OutputShared>) -> Result<OutputPipeline> {
         // small queue => bounded latency + back-pressure
         let (tx, rx) = mpsc::sync_channel::<Job>(2);
-        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let (done_tx, done_rx) = mpsc::channel::<Option<VirtualCam>>();
         let sh = shared.clone();
         thread::Builder::new().name("vcam-output".into()).spawn(move || {
             let mut cam = cam;
             let mut compositor: Option<Compositor> = None;
+            let mut sent: u64 = 0;
             while let Ok(mut job) = rx.recv() {
                 if sh.error.lock().map(|e| e.is_some()).unwrap_or(true) {
                     continue; // drain quietly so submit() never blocks
@@ -89,6 +95,10 @@ impl OutputPipeline {
                 let out = comp.render(&job.source, &job.alpha, job.zoom, job.threshold);
                 if let Some(cam) = cam.as_mut() {
                     cam.send(out);
+                    if sent % 10 == 0 {
+                        sh.consumers.store(cam.consumers(), Ordering::Relaxed);
+                    }
+                    sent += 1;
                     cam.sleep_until_next_frame();
                 }
                 let shared_frame = Arc::new(out.clone());
@@ -100,8 +110,9 @@ impl OutputPipeline {
                     *r = rect;
                 }
             }
-            drop(cam); // closes the virtual camera
-            let _ = done_tx.send(());
+            // Hand the virtual camera back (on-demand mode keeps it open between
+            // sessions); if nobody takes it, it is dropped here, which closes it.
+            let _ = done_tx.send(cam);
         })?;
         Ok(OutputPipeline { tx: Some(tx), done: done_rx, shared })
     }
@@ -123,16 +134,19 @@ impl OutputPipeline {
         }
     }
 
-    /// Drain and stop the worker (which also closes the virtual camera).
-    pub fn close(&mut self) {
+    /// Drain and stop the worker. Returns the virtual camera, still open; dropping it
+    /// closes it.
+    pub fn close(&mut self) -> Option<VirtualCam> {
         if self.tx.take().is_some() {
-            let _ = self.done.recv_timeout(Duration::from_secs(2));
+            self.done.recv_timeout(Duration::from_secs(2)).ok().flatten()
+        } else {
+            None
         }
     }
 }
 
 impl Drop for OutputPipeline {
     fn drop(&mut self) {
-        self.close();
+        let _ = self.close();
     }
 }

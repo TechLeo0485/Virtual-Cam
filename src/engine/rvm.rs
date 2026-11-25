@@ -47,6 +47,8 @@ pub fn build_session(model_path: &Path, provider: Provider, threads: usize) -> R
     match provider {
         Provider::Cpu => {}
         Provider::Cuda => {
+            // Before the CUDA context exists: wait for the GPU without spinning a CPU core.
+            super::ort_env::cuda_blocking_sync();
             b = disp(b.with_memory_pattern(false))?;
             // Exhaustive: cuDNN times every convolution algorithm on the first run of each
             // input shape and keeps the fastest. Measured 1.5-3 ms/frame faster than
@@ -150,8 +152,27 @@ type Bench = Option<(f64, f64, Provider)>;
 /// adopted when it both runs the model *and* clearly beats the CPU. `bench` is `None`
 /// when no GPU was tried, else (cpu_ms, gpu_ms, gpu).
 fn auto_session(model_path: &Path, threads: usize, width: usize, height: usize) -> Result<(Session, Provider, Bench)> {
+    // An NVIDIA GPU that runs CUDA 12 beats the CPU on this net (even a GTX 1050 Ti:
+    // 14-29 ms vs 23-54 ms per frame), so try CUDA first and skip the CPU trial. That
+    // trial ran the model on 8 CPU threads at every start and every settings change
+    // that rebuilds the pipeline. Weaker GPUs (DirectML) still race the CPU below.
+    let mut cuda_failed = false;
+    if gpu_providers().contains(&Provider::Cuda) {
+        let trial = build_session(model_path, Provider::Cuda, threads)
+            .and_then(|mut s| bench_session(&mut s, width, height, 2).map(|_| s)); // prove it runs
+        match trial {
+            Ok(sess) => return Ok((sess, Provider::Cuda, None)),
+            Err(exc) => {
+                vlog!("[vcam] {} failed: {}", Provider::Cuda.name(), exc);
+                cuda_failed = true;
+            }
+        }
+    }
     let mut cpu_sess = build_session(model_path, Provider::Cpu, threads)?;
-    let gpus = gpu_providers();
+    let gpus: Vec<Provider> = gpu_providers()
+        .into_iter()
+        .filter(|p| !(cuda_failed && *p == Provider::Cuda))
+        .collect();
     if gpus.is_empty() {
         return Ok((cpu_sess, Provider::Cpu, None));
     }
