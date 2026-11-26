@@ -1,0 +1,13 @@
+# ONNX Runtime + the CUDA 12.6 / cuDNN 9.5 DLLs shipped in the installer.
+# fetch_runtime.py downloads these wheels (Windows x64) and extracts only the DLLs.
+# They are the versions the working bundle was built and tested with. Changing any line
+# changes the runtime: bump ci/runtime-rev.txt in the same commit, so installed copies
+# take the full installer for that update instead of the small update package.
+onnxruntime-gpu==1.20.2
+nvidia-cuda-runtime-cu12==12.6.77
+nvidia-cuda-nvrtc-cu12==12.6.77
+nvidia-cublas-cu12==12.6.4.1
+nvidia-cufft-cu12==11.3.0.4
+nvidia-curand-cu12==10.3.7.77
+nvidia-cudnn-cu12==9.5.1.17
+nvidia-nvjitlink-cu12==12.6.85

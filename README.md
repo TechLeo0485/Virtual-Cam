@@ -28,8 +28,10 @@ which Google Meet, Zoom, Teams, Discord and OBS can select like a normal webcam.
 | `src/ui/` | The egui control panel (`app.rs`), its look (`theme.rs`, `widgets.rs`), settings file, preview rendering. |
 | `build.cmd` | Local release build + bundle into `release\vcam\` (needs Rust). |
 | `.github/workflows/build.yml` | Cloud build on GitHub Actions (no Rust needed locally). |
-| `.github/workflows/release.yml` | Publishes a GitHub Release when a `vX.Y.Z` tag is pushed. |
-| `src/update.rs` | Update check against the GitHub Releases. |
+| `.github/workflows/release.yml` | Builds the installers and publishes a GitHub Release when a `vX.Y.Z` tag is pushed. |
+| `installer/vcam.iss` | Inno Setup script: the full setup and the small update package. |
+| `ci/` | Pinned ONNX Runtime / CUDA wheels, runtime revision, and the script that extracts their DLLs. |
+| `src/update.rs` | Update check and in-app update against the GitHub Releases. |
 
 ## Build
 
@@ -43,23 +45,53 @@ which Google Meet, Zoom, Teams, Discord and OBS can select like a normal webcam.
 3. Unzip it and copy `vcam.exe` and `vcam-cli.exe` into `release\vcam\`, replacing the
    old ones. The models and the ONNX Runtime / CUDA DLLs already there are reused.
 
-### Releases and the update check
+### Releases, installers and updates
 
 The version lives in `Cargo.toml` (`version = "0.9.0"`). To publish a release:
 
 1. Set the new version in `Cargo.toml` and commit it.
 2. Tag and push the tag: `git tag v0.9.1` then `git push origin v0.9.1`.
 3. `.github/workflows/release.yml` checks that the tag matches `Cargo.toml`, builds, runs
-   the tests and publishes **vcam-0.9.1-windows-x64.zip** on the repository's Releases
-   page. Unzip it over `release\vcam\` (the models and DLLs there are reused).
+   the tests, builds two installers with Inno Setup (`installer/vcam.iss`) and publishes
+   them on the repository's Releases page:
+   - **vcam-setup-0.9.1.exe**: everything (program, both models, ONNX Runtime, the
+     CUDA 12.6 / cuDNN 9.5 DLLs, the Visual C++ runtime). This is what people download
+     for a first install; nothing is downloaded when vcam runs. About 1 GB.
+   - **vcam-update-0.9.1-rt1.exe**: the program files only (about 10 MB), for
+     installations already on runtime revision 1.
 
-The control panel checks GitHub for a newer release at start and every 12 hours. The
-footer shows `vcam 0.9.0 · up to date`, or an **Update available** button that opens the
-release page; `vcam-cli --check-update` does the same from the command line. The
-repository to check is baked in at build time from `GITHUB_REPOSITORY`, which GitHub
+To try the installers before tagging: Actions tab -> **release** -> **Run workflow**. The
+run builds both installers and attaches them to itself for 3 days, publishing nothing.
+
+**Installing.** The setup installs for the current user into
+`%LOCALAPPDATA%\Programs\vcam` with no admin prompt (its first page offers an all-users
+install instead), adds a Start-menu shortcut, and optionally a desktop shortcut and
+"Start vcam with Windows" (in the tray, see above). OBS Studio is still needed once for
+the "OBS Virtual Camera" driver; the setup says so when it is missing. Uninstall from
+Windows Settings -> Apps.
+
+**Updating.** The control panel checks GitHub for a newer release at start and every 12
+hours; the footer shows `vcam 0.9.0 · up to date` or **Install update v0.9.1 (10 MB)**.
+That button downloads the right installer (the small update package when the runtime is
+unchanged, else the full setup), checks its size and SHA-256, and runs it silently: it
+closes vcam, installs, and starts vcam again. A copy not installed by the setup (no
+`runtime-rev.txt` next to the exe) gets a button that opens the release page instead.
+`vcam-cli --check-update` checks from the command line.
+
+The repository to check is baked in at build time from `GITHUB_REPOSITORY`, which GitHub
 Actions sets (set `VCAM_UPDATE_REPO=owner/name` for a local build). A build without it
 never checks. GitHub answers only for a public repository; with a private one the check
 reports "failed".
+
+**Runtime revision.** `ci/runtime-requirements.txt` pins the ONNX Runtime and CUDA
+wheels the DLLs come from; `ci/runtime-rev.txt` numbers that set. When you change the
+pins (or the models), bump the number in the same commit: installed copies then take the
+full setup for that update, because their small update package would lack the new DLLs.
+
+**CI caches.** The DLLs (`ci-cache/runtime`, key: the pins) and the models
+(`ci-cache/models`, key: `src/models.rs`) are kept in the GitHub Actions cache, so a
+release only downloads them again after one of those files changes. The Rust build is
+cached too.
 
 ### Locally (needs Rust)
 

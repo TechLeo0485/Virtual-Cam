@@ -39,6 +39,11 @@ pub fn is_hidden() -> bool {
     HIDDEN.load(Ordering::Relaxed)
 }
 
+/// Take the icon out of the tray now (before exiting).
+pub fn remove() {
+    TRAY.with(|t| t.borrow_mut().take());
+}
+
 /// Hide the window to the tray.
 pub fn hide_window() {
     if let Some(hwnd) = main_window() {

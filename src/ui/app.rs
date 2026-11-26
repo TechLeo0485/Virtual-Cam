@@ -60,6 +60,8 @@ pub struct VcamApp {
     frames_drawn: u32,
     /// GitHub Releases check (footer).
     updates: UpdateChecker,
+    /// `runtime-rev.txt` of this installation (None = not installed by the setup).
+    runtime_rev: Option<String>,
     // options
     cam_idx: usize,
     bg_enabled: bool,
@@ -154,6 +156,7 @@ impl VcamApp {
             start_hidden: false,
             frames_drawn: 0,
             updates: UpdateChecker::start(),
+            runtime_rev: update::installed_runtime_rev(),
             cam_idx: 0,
             bg_enabled: settings.bg_enabled,
             blur_image: false,
@@ -1333,8 +1336,15 @@ impl eframe::App for VcamApp {
 
         let mut theme_choice = self.theme;
         let update_state = self.updates.state();
+        if update_state == UpdateState::Launched {
+            // The installer is running; it replaces the files and starts vcam again.
+            self.worker.stop();
+            tray::remove();
+            std::process::exit(0);
+        }
         let mut check_clicked = false;
         let mut open_url: Option<String> = None;
+        let mut install: Option<update::Release> = None;
         egui::TopBottomPanel::bottom("footer").show(ctx, |ui| {
             ui.add_space(3.0);
             ui.horizontal(|ui| {
@@ -1350,12 +1360,29 @@ impl eframe::App for VcamApp {
                         w::hint(ui, "\u{b7} update check failed");
                         check_clicked = ui.small_button("Retry").on_hover_text(e.as_str()).clicked();
                     }
-                    UpdateState::Available(r) => {
-                        let text = format!("\u{2b07} Update available: v{} \u{2014} download", r.version);
-                        if ui.button(text).on_hover_text(r.url.as_str()).clicked() {
-                            open_url = Some(r.url.clone());
+                    UpdateState::Available(r) => match r.installer_for(self.runtime_rev.as_deref()) {
+                        Some(a) => {
+                            let text = format!("\u{2b07} Install update v{} ({:.0} MB)", r.version, a.size as f64 / 1e6);
+                            let hover = "Downloads the installer, closes vcam, updates it and starts it again.";
+                            if ui.button(text).on_hover_text(hover).clicked() {
+                                install = Some(r.clone());
+                            }
+                            if ui.small_button("What's new").clicked() {
+                                open_url = Some(r.url.clone());
+                            }
                         }
+                        None => {
+                            let text = format!("\u{2b07} Update available: v{} \u{2014} download", r.version);
+                            if ui.button(text).on_hover_text(r.url.as_str()).clicked() {
+                                open_url = Some(r.url.clone());
+                            }
+                        }
+                    },
+                    UpdateState::Downloading(v) => {
+                        ui.spinner();
+                        w::hint(ui, &format!("downloading update v{}\u{2026}", v));
                     }
+                    UpdateState::Launched => {}
                 }
             });
             ui.horizontal(|ui| {
@@ -1376,6 +1403,9 @@ impl eframe::App for VcamApp {
         }
         if let Some(url) = open_url {
             update::open_in_browser(&url);
+        }
+        if let Some(release) = install {
+            self.updates.install(&release);
         }
         if theme_choice != self.theme {
             self.theme = theme_choice;

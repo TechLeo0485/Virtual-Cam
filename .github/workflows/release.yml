@@ -1,19 +1,26 @@
-# Publishes a GitHub Release when a version tag is pushed:
+# Builds the vcam installers and publishes a GitHub Release.
 #
-#   1. set `version = "X.Y.Z"` in Cargo.toml (and commit it)
-#   2. git tag vX.Y.Z && git push origin vX.Y.Z
+#   Release: set `version = "X.Y.Z"` in Cargo.toml, commit, then
+#            git tag vX.Y.Z && git push origin vX.Y.Z
+#   Test:    Actions tab -> release -> "Run workflow": builds both installers and
+#            attaches them to the run (kept 3 days), publishes nothing.
 #
-# The run fails if the tag and Cargo.toml disagree. It builds, runs the tests, and
-# attaches vcam-X.Y.Z-windows-x64.zip (vcam.exe, vcam-cli.exe, assets, README) to a
-# new release with generated notes. Running copies of vcam find it through their update
-# check (src/update.rs). The zip holds the program only: unzip it over an existing
-# release\vcam\ folder, which already has the models and the ONNX Runtime / CUDA DLLs.
+# Assets of a release:
+#   vcam-setup-X.Y.Z.exe         everything; for a first install (no downloads later)
+#   vcam-update-X.Y.Z-rtN.exe    program files only, for installs on runtime revision N
+#                                (ci/runtime-rev.txt); what the in-app update prefers
+#
+# Caches (re-used until their key changes, so a normal release downloads nothing):
+#   ci-cache/runtime  ONNX Runtime + CUDA/cuDNN DLLs  key: ci/runtime-requirements.txt
+#   ci-cache/models   the RVM models                  key: src/models.rs
+#   Inno Setup        installed with Chocolatey when the runner image lacks it
 
 name: release
 
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write # create the release
@@ -24,18 +31,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check the tag matches Cargo.toml
+      - name: Version
         id: ver
         shell: bash
         run: |
           crate=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
-          tag="${GITHUB_REF_NAME#v}"
-          if [ "$crate" != "$tag" ]; then
+          if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "${GITHUB_REF_NAME#v}" != "$crate" ]; then
             echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $crate"
             exit 1
           fi
           echo "version=$crate" >> "$GITHUB_OUTPUT"
+          echo "runtime_rev=$(tr -d '[:space:]' < ci/runtime-rev.txt)" >> "$GITHUB_OUTPUT"
 
+      # ---- program -------------------------------------------------------------
       - name: Install Rust (stable, MSVC)
         shell: bash
         run: |
@@ -53,18 +61,81 @@ jobs:
         shell: bash
         run: cargo test --release
 
-      - name: Package
+      # ---- runtime DLLs (cached) ------------------------------------------------
+      - name: Cache runtime DLLs
+        id: runtime
+        uses: actions/cache@v4
+        with:
+          path: ci-cache/runtime
+          key: runtime-${{ hashFiles('ci/runtime-requirements.txt', 'ci/fetch_runtime.py') }}
+
+      - uses: actions/setup-python@v5
+        if: steps.runtime.outputs.cache-hit != 'true'
+        with:
+          python-version: "3.12"
+
+      - name: Download runtime DLLs (cache miss only)
+        if: steps.runtime.outputs.cache-hit != 'true'
+        shell: bash
+        run: python ci/fetch_runtime.py ci-cache/runtime
+
+      # ---- models (cached) ------------------------------------------------------
+      - name: Cache models
+        id: models
+        uses: actions/cache@v4
+        with:
+          path: ci-cache/models
+          key: models-${{ hashFiles('src/models.rs') }}
+
+      - name: Download models (cache miss only)
+        if: steps.models.outputs.cache-hit != 'true'
+        shell: bash
+        run: target/release/vcam-cli.exe --download-models ci-cache/models
+
+      # ---- stage the install folder -------------------------------------------------
+      - name: Stage dist/vcam
         shell: pwsh
         run: |
-          $name = "vcam-${{ steps.ver.outputs.version }}-windows-x64"
-          New-Item -ItemType Directory -Force "dist/vcam" | Out-Null
-          Copy-Item target/release/vcam.exe, target/release/vcam-cli.exe, README.md "dist/vcam/"
-          Copy-Item -Recurse assets "dist/vcam/assets"
-          Compress-Archive -Path "dist/vcam" -DestinationPath "dist/$name.zip"
-          "ZIP=dist/$name.zip" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          $d = "dist/vcam"
+          New-Item -ItemType Directory -Force $d, "$d/models" | Out-Null
+          Copy-Item target/release/vcam.exe, target/release/vcam-cli.exe, README.md $d
+          Copy-Item -Recurse assets "$d/assets"
+          Copy-Item -Recurse ci-cache/runtime/* $d
+          Copy-Item ci-cache/models/*.onnx "$d/models"
+          # Visual C++ runtime, app-local (onnxruntime needs it; fresh PCs may lack it)
+          foreach ($f in "msvcp140.dll","msvcp140_1.dll","msvcp140_2.dll","vcruntime140.dll","vcruntime140_1.dll","concrt140.dll") {
+            Copy-Item "$env:SystemRoot/System32/$f" $d
+          }
+          Set-Content -NoNewline -Encoding ascii "$d/runtime-rev.txt" "${{ steps.ver.outputs.runtime_rev }}"
+          "{0:N0} MB staged" -f ((Get-ChildItem -Recurse $d | Measure-Object Length -Sum).Sum / 1MB)
+
+      # ---- installers --------------------------------------------------------------
+      - name: Build installers
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup --no-progress -y | Out-Null
+          }
+          $common = @("/DAppVersion=${{ steps.ver.outputs.version }}", "/DRuntimeRev=${{ steps.ver.outputs.runtime_rev }}", "/DStageDir=$PWD\dist\vcam", "/O$PWD\dist")
+          & $iscc @common "/DFull=1" installer\vcam.iss
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & $iscc @common "/DFull=0" installer\vcam.iss
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Get-ChildItem dist/*.exe | ForEach-Object { "{0}  {1:N0} MB" -f $_.Name, ($_.Length / 1MB) }
 
       - name: Publish the release
+        if: github.ref_type == 'tag'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" "$ZIP" --title "vcam $GITHUB_REF_NAME" --generate-notes
+        run: gh release create "$GITHUB_REF_NAME" dist/vcam-setup-*.exe dist/vcam-update-*.exe --title "vcam $GITHUB_REF_NAME" --generate-notes
+
+      - name: Attach installers to the run (manual test build)
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: vcam-installers-${{ steps.ver.outputs.version }}
+          path: dist/*.exe
+          retention-days: 3
+          compression-level: 0

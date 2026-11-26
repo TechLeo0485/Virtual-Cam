@@ -9,3 +9,7 @@
 
 # Self-test report
 vcam_selftest.txt
+
+# Installer staging / output and CI download caches (release.yml)
+/dist/
+/ci-cache/

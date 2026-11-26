@@ -1,9 +1,11 @@
 //! Update check against the project's GitHub Releases.
 //!
 //! A release is a git tag `vX.Y.Z` pushed to GitHub; `.github/workflows/release.yml`
-//! builds it and publishes `vcam-X.Y.Z-windows-x64.zip` on the Releases page. This
-//! module asks GitHub for the newest published release (drafts and pre-releases are
-//! skipped) and compares its tag with the running version (`Cargo.toml`).
+//! builds it and publishes two installers on the Releases page: `vcam-setup-X.Y.Z.exe`
+//! (everything) and `vcam-update-X.Y.Z-rtN.exe` (program files only, for installs on
+//! runtime revision N). This module asks GitHub for the newest published release (drafts
+//! and pre-releases are skipped), compares its tag with the running version
+//! (`Cargo.toml`), and can download and run the installer that fits this installation.
 //!
 //! The repository ("owner/name") is baked in at build time: `VCAM_UPDATE_REPO` when set,
 //! otherwise `GITHUB_REPOSITORY`, which GitHub Actions sets on every build. A local
@@ -51,11 +53,93 @@ pub fn is_newer(candidate: &str, current: &str) -> bool {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct Asset {
+    pub name: String,
+    pub url: String,
+    pub size: u64,
+    /// SHA-256 (hex) when GitHub reports a digest for the file.
+    pub sha256: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct Release {
     /// e.g. "0.9.1"
     pub version: String,
     /// The release's page on GitHub (notes + download).
     pub url: String,
+    pub assets: Vec<Asset>,
+}
+
+impl Release {
+    /// The installer that brings this installation to the release: the small update
+    /// package when it was built for the same runtime revision, else the full setup.
+    /// `None` for a copy the setup did not install (no `runtime-rev.txt`), which can
+    /// only be updated from the release page.
+    pub fn installer_for(&self, runtime_rev: Option<&str>) -> Option<&Asset> {
+        let rev = runtime_rev?;
+        let small = format!("vcam-update-{}-rt{}.exe", self.version, rev);
+        let full = format!("vcam-setup-{}.exe", self.version);
+        let find = |n: &str| self.assets.iter().find(|a| a.name.eq_ignore_ascii_case(n));
+        find(&small).or_else(|| find(&full))
+    }
+}
+
+/// Runtime revision of this installation: `runtime-rev.txt` next to the exe, written by
+/// the full installer (the DLL + model set; see ci/runtime-rev.txt). `None` for a
+/// portable or developer copy.
+pub fn installed_runtime_rev() -> Option<String> {
+    std::fs::read_to_string(crate::util::exe_dir().join("runtime-rev.txt"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Download `asset` to %TEMP%, check its size (and SHA-256 when known), and start it
+/// silently. The installer closes vcam, installs, and starts vcam again. Blocks for the
+/// whole download: run it off the UI thread.
+pub fn download_and_launch(asset: &Asset) -> Result<()> {
+    let dir = std::env::temp_dir().join("vcam-update");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(&asset.name);
+    let _ = std::fs::remove_file(&path);
+    vlog!("[vcam] Downloading {} ...", asset.url);
+    let checked = (|| -> Result<()> {
+        crate::models::download(&asset.url, &path)?;
+        let len = std::fs::metadata(&path)?.len();
+        if asset.size > 0 && len != asset.size {
+            bail!("the download is incomplete ({} of {} bytes)", len, asset.size);
+        }
+        if let Some(want) = asset.sha256.as_deref() {
+            let got = crate::models::sha256_hex(&path)?;
+            if !got.eq_ignore_ascii_case(want) {
+                bail!("the download is damaged (checksum mismatch)");
+            }
+        }
+        Ok(())
+    })();
+    if let Err(e) = checked {
+        let _ = std::fs::remove_file(&path);
+        return Err(e);
+    }
+    launch_installer(&path)
+}
+
+/// Start the installer silently. ShellExecute (not CreateProcess), so an installation
+/// for all users can raise its admin prompt.
+fn launch_installer(path: &std::path::Path) -> Result<()> {
+    use windows::core::{w, HSTRING, PCWSTR};
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    let file = HSTRING::from(path.as_os_str());
+    let params = HSTRING::from("/SILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS");
+    let code = unsafe { ShellExecuteW(HWND::default(), w!("open"), &file, &params, PCWSTR::null(), SW_SHOWNORMAL) };
+    let code = code.0 as isize;
+    if code <= 32 {
+        bail!("could not start the installer (error {})", code);
+    }
+    vlog!("[vcam] Started {}", path.display());
+    Ok(())
 }
 
 /// The newest published release, whatever its version.
@@ -80,7 +164,27 @@ pub fn latest_release() -> Result<Release> {
         .and_then(|u| u.as_str())
         .map(str::to_string)
         .unwrap_or_else(|| format!("https://github.com/{}/releases/latest", repo));
-    Ok(Release { version: tag.trim_start_matches(['v', 'V']).to_string(), url: page })
+    let assets = v
+        .get("assets")
+        .and_then(|a| a.as_array())
+        .map(|list| {
+            list.iter()
+                .filter_map(|a| {
+                    Some(Asset {
+                        name: a.get("name")?.as_str()?.to_string(),
+                        url: a.get("browser_download_url")?.as_str()?.to_string(),
+                        size: a.get("size").and_then(|s| s.as_u64()).unwrap_or(0),
+                        sha256: a
+                            .get("digest")
+                            .and_then(|d| d.as_str())
+                            .and_then(|d| d.strip_prefix("sha256:"))
+                            .map(str::to_string),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(Release { version: tag.trim_start_matches(['v', 'V']).to_string(), url: page, assets })
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -90,6 +194,10 @@ pub enum UpdateState {
     Checking,
     UpToDate,
     Available(Release),
+    /// Downloading the installer for this version.
+    Downloading(String),
+    /// The installer is running: the app should exit now.
+    Launched,
     Failed(String),
 }
 
@@ -108,6 +216,14 @@ impl UpdateChecker {
         let (tx, rx) = mpsc::channel::<()>();
         let st = state.clone();
         let spawned = std::thread::Builder::new().name("vcam-update".into()).spawn(move || loop {
+            let busy = st.lock().map(|s| matches!(*s, UpdateState::Downloading(_) | UpdateState::Launched)).unwrap_or(false);
+            if busy {
+                // an update is being installed: don't overwrite its state
+                if let Err(mpsc::RecvTimeoutError::Disconnected) = rx.recv_timeout(RECHECK_EVERY) {
+                    break;
+                }
+                continue;
+            }
             if let Ok(mut s) = st.lock() {
                 *s = UpdateState::Checking;
             }
@@ -144,11 +260,44 @@ impl UpdateChecker {
         self.state.lock().map(|s| s.clone()).unwrap_or(UpdateState::Disabled)
     }
 
-    /// Look again now (no effect while a check is running or in a build without a repo).
+    /// Look again now (no effect while a check or an update is running, or in a build
+    /// without a repo).
     pub fn check_now(&self) {
-        if self.state() != UpdateState::Checking {
+        let idle = !matches!(self.state(), UpdateState::Checking | UpdateState::Downloading(_) | UpdateState::Launched);
+        if idle {
             if let Some(tx) = self.wake.as_ref() {
                 let _ = tx.send(());
+            }
+        }
+    }
+
+    /// Install `release`: download its installer in the background and start it (state
+    /// `Downloading`, then `Launched` or `Failed`). Without an installer for this copy,
+    /// opens the release page instead.
+    pub fn install(&self, release: &Release) {
+        let Some(asset) = release.installer_for(installed_runtime_rev().as_deref()).cloned() else {
+            open_in_browser(&release.url);
+            return;
+        };
+        if let Ok(mut s) = self.state.lock() {
+            *s = UpdateState::Downloading(release.version.clone());
+        }
+        let st = self.state.clone();
+        let spawned = std::thread::Builder::new().name("vcam-update-install".into()).spawn(move || {
+            let next = match download_and_launch(&asset) {
+                Ok(()) => UpdateState::Launched,
+                Err(e) => {
+                    vlog!("[vcam] Update failed: {}", e);
+                    UpdateState::Failed(format!("update failed: {}", e))
+                }
+            };
+            if let Ok(mut s) = st.lock() {
+                *s = next;
+            }
+        });
+        if spawned.is_err() {
+            if let Ok(mut s) = self.state.lock() {
+                *s = UpdateState::Failed("could not start the download".into());
             }
         }
     }
@@ -174,5 +323,18 @@ mod tests {
         assert!(!is_newer("v0.9.0", "0.9.0"));
         assert!(!is_newer("0.8.5", "0.9.0"));
         assert!(!is_newer("garbage", "0.9.0"));
+    }
+
+    #[test]
+    fn picks_the_small_update_when_the_runtime_matches() {
+        let asset = |n: &str| Asset { name: n.into(), url: format!("https://x/{}", n), size: 1, sha256: None };
+        let rel = Release {
+            version: "0.9.1".into(),
+            url: "https://x".into(),
+            assets: vec![asset("vcam-setup-0.9.1.exe"), asset("vcam-update-0.9.1-rt1.exe")],
+        };
+        assert_eq!(rel.installer_for(Some("1")).unwrap().name, "vcam-update-0.9.1-rt1.exe");
+        assert_eq!(rel.installer_for(Some("2")).unwrap().name, "vcam-setup-0.9.1.exe");
+        assert!(rel.installer_for(None).is_none()); // not installed by the setup
     }
 }
