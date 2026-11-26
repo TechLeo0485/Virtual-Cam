@@ -21,8 +21,11 @@
   #define StageDir "..\dist\vcam"
 #endif
 #ifndef Full
-  #define Full 1
+  #define Full "1"
 #endif
+; /D values arrive as strings ("1" / "0"), and ISPP treats any non-empty string as
+; true, so compare once and use the 0/1 result below.
+#define IsFull (Full == "1")
 ; Never change: identifies the installation for upgrades and the update package.
 #define AppGuid "8E5F3C1A-4B7D-4E2A-9C61-2D3F7A8B9E10"
 
@@ -53,7 +56,7 @@ SolidCompression=yes
 LZMAUseSeparateProcess=yes
 LZMANumBlockThreads=4
 OutputDir=..\dist
-#if Full
+#if IsFull
 OutputBaseFilename=vcam-setup-{#AppVersion}
 #else
 OutputBaseFilename=vcam-update-{#AppVersion}-rt{#RuntimeRev}
@@ -63,14 +66,14 @@ DisableDirPage=yes
 DisableReadyPage=yes
 #endif
 
-#if Full
+#if IsFull
 [Tasks]
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; Flags: unchecked
 Name: "autostart"; Description: "Start vcam with &Windows (in the tray, the webcam starts only when an app uses it)"
 #endif
 
 [Files]
-#if Full
+#if IsFull
 Source: "{#StageDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 #else
 Source: "{#StageDir}\vcam.exe"; DestDir: "{app}"; Flags: ignoreversion
@@ -79,7 +82,7 @@ Source: "{#StageDir}\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#StageDir}\assets\*"; DestDir: "{app}\assets"; Flags: ignoreversion recursesubdirs createallsubdirs
 #endif
 
-#if Full
+#if IsFull
 [Icons]
 Name: "{autoprograms}\vcam"; Filename: "{app}\vcam.exe"
 Name: "{autodesktop}\vcam"; Filename: "{app}\vcam.exe"; Tasks: desktopicon
@@ -101,7 +104,7 @@ Filename: "{sys}\taskkill.exe"; Parameters: "/IM vcam.exe /F"; Flags: runhidden;
 const
   OBS_VCAM_KEY = 'CLSID\{A3FCE0F5-3493-419F-958A-ABA1250EC20B}';
 
-#if !Full
+#if !IsFull
 function InstalledDir(): String;
 var
   Key, S: String;
