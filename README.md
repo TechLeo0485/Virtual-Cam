@@ -132,6 +132,9 @@ target\release\vcam.exe --selftest      :: checks ONNX Runtime + RVM, writes vca
   the webcam and the model (the app sees black for the few seconds this takes); 5 seconds
   after the last app turns it off, it goes back to standby. The command line has the
   same mode: `vcam-cli --on-demand`.
+- **Preview now** (card 2, in this mode): turns the webcam on without a meeting, so the
+  picture can be checked first; the output preview tab opens. **Stop preview**, turning
+  vcam off, or hiding it to the tray ends it (an app using the camera keeps it running).
 - How "an app is using it" is detected: OBS's virtual-camera filter opens vcam's
   shared-memory queue only while an app streams from it, so vcam counts the handles
   open on that queue. An app that merely lists cameras doesn't count.

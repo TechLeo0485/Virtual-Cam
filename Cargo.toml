@@ -1,6 +1,6 @@
 [package]
 name = "vcam"
-version = "0.9.0"
+version = "0.9.1"
 edition = "2021"
 description = "Real-time webcam virtual background (RobustVideoMatting) published as a system virtual camera. Rust port of vcam.py / vcam_ui.py."
 default-run = "vcam"

@@ -562,6 +562,9 @@ impl VcamApp {
         };
         let cameras = self.cameras.clone();
         let mut on_demand = self.on_demand;
+        let show_preview_button = self.on_demand && on;
+        let preview_on = self.worker.preview();
+        let mut preview_clicked = false;
         w::card(ui, "2. Camera on / off", |ui| {
             toggle_clicked = w::primary_button(ui, if on { "Turn OFF" } else { "Turn ON" }, on).clicked();
             w::status(ui, run_tone, run_text);
@@ -569,6 +572,16 @@ impl VcamApp {
                 "The webcam and the model start when Meet, Zoom, Teams... turn on \"OBS Virtual \
                  Camera\", and stop 5 seconds after they turn it off. vcam starts armed.",
             );
+            if show_preview_button {
+                let label = if preview_on { "\u{25a0} Stop preview" } else { "\u{25b6} Preview now" };
+                preview_clicked = ui
+                    .button(label)
+                    .on_hover_text(
+                        "Turns the webcam on without a meeting, to check the picture first. \
+                         Stops when you click again or hide vcam to the tray.",
+                    )
+                    .clicked();
+            }
             w::field_row(ui, "Camera", |ui| {
                 let count = if cameras.is_empty() { 9 } else { cameras.len().max(cam_idx + 1) };
                 let r = w::combo(ui, "camera", &Self::camera_label(&cameras, cam_idx), |ui| {
@@ -586,6 +599,12 @@ impl VcamApp {
         }
         if toggle_clicked {
             self.toggle();
+        }
+        if preview_clicked {
+            self.worker.set_preview(!preview_on);
+            if !preview_on {
+                self.tab = 1; // show "2. Output preview"
+            }
         }
         if on_demand != self.on_demand {
             // Switches between standby and always-on (the worker reconnects).
@@ -1297,8 +1316,10 @@ impl eframe::App for VcamApp {
             ctx.request_repaint(); // get to frame 3 right away
         }
         if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close && self.in_tray {
-            // The X hides to the tray; "Quit vcam" in the tray menu exits.
+            // The X hides to the tray; "Quit vcam" in the tray menu exits. Nobody can see
+            // the preview there, so stop it (an app using the camera keeps it running).
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.worker.set_preview(false);
             tray::hide_window();
         } else if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close {
             let msg = if st.running { "The virtual camera is ON \u{2014} quit and turn it off?" } else { "Quit vcam?" };

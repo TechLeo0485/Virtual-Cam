@@ -221,6 +221,8 @@ struct Inner {
     stop: AtomicBool,
     restart: AtomicBool,
     bg_dirty: AtomicBool,
+    /// On-demand mode: run the webcam for the preview even with no app watching.
+    preview: AtomicBool,
     /// newest FULL camera frame (after rotation), for the crop tab
     raw: Mutex<Option<Arc<Bgr>>>,
     output: Mutex<Option<Arc<OutputShared>>>,
@@ -246,6 +248,7 @@ impl VCamWorker {
                 stop: AtomicBool::new(false),
                 restart: AtomicBool::new(false),
                 bg_dirty: AtomicBool::new(false),
+                preview: AtomicBool::new(false),
                 raw: Mutex::new(None),
                 output: Mutex::new(None),
             }),
@@ -300,6 +303,18 @@ impl VCamWorker {
 
     /// Live quality/speed balance (RVM downsample_ratio). Takes effect on the next
     /// frame while running; also remembered for the next start.
+    /// On-demand mode: keep the webcam running for the preview, as if an app were
+    /// watching (so the picture can be checked before a meeting). Turning it off goes
+    /// back to standby 5 seconds later unless an app is using the camera. No effect
+    /// on the always-on mode.
+    pub fn set_preview(&self, on: bool) {
+        self.inner.preview.store(on, Ordering::SeqCst);
+    }
+
+    pub fn preview(&self) -> bool {
+        self.inner.preview.load(Ordering::SeqCst)
+    }
+
     pub fn set_quality(&self, downsample: f32) {
         self.inner.cfg.lock().unwrap().downsample = Some(downsample);
     }
@@ -354,6 +369,7 @@ impl VCamWorker {
     }
 
     pub fn stop(&self) {
+        self.inner.preview.store(false, Ordering::SeqCst);
         self.inner.stop.store(true, Ordering::SeqCst);
         if let Some(rx) = self.done.lock().unwrap().take() {
             let _ = rx.recv_timeout(Duration::from_secs(3));
@@ -499,6 +515,10 @@ fn standby(inner: &Arc<Inner>, cfg: &Config, keep: &mut Option<VirtualCam>) -> R
             vlog!("[vcam] An app opened the virtual camera -> starting");
             return Ok(true);
         }
+        if inner.preview.load(Ordering::SeqCst) {
+            vlog!("[vcam] Preview requested -> starting");
+            return Ok(true);
+        }
         // One frame a second keeps the camera visible to apps (OBS repeats it).
         if last_send.map_or(true, |t| t.elapsed() >= Duration::from_secs(1)) {
             cam.send(&black);
@@ -604,7 +624,7 @@ fn run_session(inner: &Arc<Inner>, keep: &mut Option<VirtualCam>) -> Result<()> 
                 bail!("{}", e);
             }
             if on_demand {
-                if pipeline.shared.consumers.load(Ordering::Relaxed) > 0 {
+                if pipeline.shared.consumers.load(Ordering::Relaxed) > 0 || inner.preview.load(Ordering::SeqCst) {
                     last_watched = Instant::now();
                 } else if last_watched.elapsed() >= IDLE_STOP {
                     vlog!("[vcam] No app is using the virtual camera -> standby");
